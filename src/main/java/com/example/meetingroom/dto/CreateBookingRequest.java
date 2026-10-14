@@ -11,6 +11,7 @@ public class CreateBookingRequest {
     private String title;
     private String organiserEmail;
     private List<String> attendeeEmails;
+    private String idempotencyKey;
 
     @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm[:ss]")
     private LocalDateTime startTime;
@@ -29,6 +30,13 @@ public class CreateBookingRequest {
         this.attendeeEmails = attendeeEmails;
         this.startTime = startTime;
         this.endTime = endTime;
+    }
+
+    public CreateBookingRequest(Long roomId, String title, String organiserEmail,
+                                List<String> attendeeEmails, LocalDateTime startTime, LocalDateTime endTime,
+                                String idempotencyKey) {
+        this(roomId, title, organiserEmail, attendeeEmails, startTime, endTime);
+        this.idempotencyKey = idempotencyKey;
     }
 
     public Long getRoomId() {
@@ -85,5 +93,13 @@ public class CreateBookingRequest {
 
     public void setEndTime(LocalDateTime endTime) {
         this.endTime = endTime;
+    }
+
+    public String getIdempotencyKey() {
+        return idempotencyKey;
+    }
+
+    public void setIdempotencyKey(String idempotencyKey) {
+        this.idempotencyKey = idempotencyKey;
     }
 }

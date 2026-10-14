@@ -22,7 +22,12 @@ public class BookingController {
     }
 
     @PostMapping
-    public ResponseEntity<BookingResponse> createBooking(@RequestBody CreateBookingRequest request) {
+    public ResponseEntity<BookingResponse> createBooking(
+            @RequestBody CreateBookingRequest request,
+            @RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKeyHeader) {
+        if (request.getIdempotencyKey() == null && idempotencyKeyHeader != null && !idempotencyKeyHeader.trim().isEmpty()) {
+            request.setIdempotencyKey(idempotencyKeyHeader.trim());
+        }
         BookingResponse created = bookingService.createBooking(request);
         return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
