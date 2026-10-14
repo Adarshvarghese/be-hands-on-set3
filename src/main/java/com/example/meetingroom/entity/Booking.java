@@ -40,11 +40,19 @@ public class Booking {
     @Column(nullable = false)
     private boolean cancelled = false;
 
+    @Column(name = "idempotency_key", unique = true)
+    private String idempotencyKey;
+
     public Booking() {
     }
 
     public Booking(Room room, String title, String organiserEmail, List<String> attendeeEmails,
                    LocalDateTime startTime, LocalDateTime endTime, LocalDateTime createdTime) {
+        this(room, title, organiserEmail, attendeeEmails, startTime, endTime, createdTime, null);
+    }
+
+    public Booking(Room room, String title, String organiserEmail, List<String> attendeeEmails,
+                   LocalDateTime startTime, LocalDateTime endTime, LocalDateTime createdTime, String idempotencyKey) {
         this.room = room;
         this.title = title;
         this.organiserEmail = organiserEmail;
@@ -53,6 +61,7 @@ public class Booking {
         this.endTime = endTime;
         this.createdTime = createdTime;
         this.cancelled = false;
+        this.idempotencyKey = idempotencyKey;
     }
 
     public Long getId() {
@@ -125,5 +134,13 @@ public class Booking {
 
     public void setCancelled(boolean cancelled) {
         this.cancelled = cancelled;
+    }
+
+    public String getIdempotencyKey() {
+        return idempotencyKey;
+    }
+
+    public void setIdempotencyKey(String idempotencyKey) {
+        this.idempotencyKey = idempotencyKey;
     }
 }

@@ -2,13 +2,17 @@ package com.example.meetingroom.service;
 
 import com.example.meetingroom.dto.BookingResponse;
 import com.example.meetingroom.dto.CreateBookingRequest;
+import com.example.meetingroom.dto.FreeSlotResponse;
+import com.example.meetingroom.dto.RoomResponse;
 import com.example.meetingroom.entity.Booking;
 import com.example.meetingroom.entity.Room;
 import com.example.meetingroom.exception.BookingConflictException;
 import com.example.meetingroom.exception.InvalidBookingException;
 import com.example.meetingroom.exception.ResourceNotFoundException;
 import com.example.meetingroom.repository.BookingRepository;
+import com.example.meetingroom.repository.RoomRepository;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
@@ -17,10 +21,12 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -36,37 +42,32 @@ public class BookingService {
     private static final LocalTime WORK_END = LocalTime.of(18, 0);
 
     private final BookingRepository bookingRepository;
+    private final RoomRepository roomRepository;
     private final RoomService roomService;
     private final Clock clock;
 
-    public BookingService(BookingRepository bookingRepository, RoomService roomService, Clock clock) {
+    public BookingService(BookingRepository bookingRepository,
+                          RoomRepository roomRepository,
+                          RoomService roomService,
+                          Clock clock) {
         this.bookingRepository = bookingRepository;
+        this.roomRepository = roomRepository;
         this.roomService = roomService;
         this.clock = clock;
     }
 
-    @Transactional
+    /**
+     * Creates a booking with database-level pessimistic locking and idempotent safe-retry support.
+     */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public BookingResponse createBooking(CreateBookingRequest request) {
         Map<String, String> fieldErrors = new LinkedHashMap<>();
 
-        // 1. Resolve room
-        Room room = null;
-        if (request.getRoomId() == null && (request.getRoomName() == null || request.getRoomName().trim().isEmpty())) {
-            fieldErrors.put("roomId", "Room identifier (roomId or roomName) must be provided");
-        } else {
-            // If unknown room, resolveRoom throws ResourceNotFoundException (404)
-            room = roomService.resolveRoom(request.getRoomId(), request.getRoomName());
-            if (!room.isActive()) {
-                fieldErrors.put("room", "Room '" + room.getName() + "' is not active and cannot be booked");
-            }
-        }
-
-        // 2. Validate Title
+        // 1. Initial basic validation
         if (request.getTitle() == null || request.getTitle().trim().isEmpty()) {
             fieldErrors.put("title", "Title is required");
         }
 
-        // 3. Validate Organiser Email
         String organiserEmail = null;
         if (request.getOrganiserEmail() == null || request.getOrganiserEmail().trim().isEmpty()) {
             fieldErrors.put("organiserEmail", "Organiser email is required");
@@ -77,7 +78,6 @@ public class BookingService {
             }
         }
 
-        // 4. Validate Attendees & Capacity (organiser is always an attendee)
         Set<String> attendeeSet = new LinkedHashSet<>();
         if (organiserEmail != null && isValidEmail(organiserEmail)) {
             attendeeSet.add(organiserEmail.toLowerCase());
@@ -93,13 +93,6 @@ public class BookingService {
             }
         }
 
-        if (room != null && attendeeSet.size() > room.getCapacity()) {
-            fieldErrors.put("attendeeEmails", String.format(
-                    "Number of attendees (%d) exceeds room capacity (%d)",
-                    attendeeSet.size(), room.getCapacity()));
-        }
-
-        // 5. Validate Date & Times
         LocalDateTime startTime = request.getStartTime();
         LocalDateTime endTime = request.getEndTime();
 
@@ -113,22 +106,18 @@ public class BookingService {
         if (startTime != null && endTime != null) {
             LocalDateTime now = LocalDateTime.now(clock);
 
-            // Cannot be in the past
             if (startTime.isBefore(now)) {
                 fieldErrors.put("startTime", "Booking start time cannot be in the past");
             }
 
-            // Must be on a single day
             if (!startTime.toLocalDate().equals(endTime.toLocalDate())) {
                 fieldErrors.put("endTime", "Booking must be on a single day");
             }
 
-            // Start before it ends
             if (!startTime.isBefore(endTime)) {
                 fieldErrors.put("startTime", "Start time must be strictly before end time");
             }
 
-            // 15-minute steps
             if (startTime.getMinute() % 15 != 0 || startTime.getSecond() != 0 || startTime.getNano() != 0) {
                 fieldErrors.put("startTime", "Start time must use 15-minute steps (:00, :15, :30, :45)");
             }
@@ -136,7 +125,6 @@ public class BookingService {
                 fieldErrors.put("endTime", "End time must use 15-minute steps (:00, :15, :30, :45)");
             }
 
-            // Within working hours 09:00 to 18:00
             LocalTime startLocal = startTime.toLocalTime();
             LocalTime endLocal = endTime.toLocalTime();
 
@@ -152,7 +140,6 @@ public class BookingService {
                 fieldErrors.put("endTime", "Booking end time must be within working hours (09:00 to 18:00)");
             }
 
-            // Last at most 4 hours (240 minutes)
             if (startTime.isBefore(endTime)) {
                 Duration duration = Duration.between(startTime, endTime);
                 if (duration.toMinutes() > 240) {
@@ -161,22 +148,62 @@ public class BookingService {
             }
         }
 
-        // If any validation failed, return 400 with a message per invalid field
+        if (request.getRoomId() == null && (request.getRoomName() == null || request.getRoomName().trim().isEmpty())) {
+            fieldErrors.put("roomId", "Room identifier (roomId or roomName) must be provided");
+        }
+
+        // If field validation fails, immediately return 400
         if (!fieldErrors.isEmpty()) {
             throw new InvalidBookingException("Validation failed for one or more fields", fieldErrors);
         }
 
-        // 6. Overlap Conflict Check
-        // A booking can't overlap another booking in the same room.
-        // Back-to-back bookings (e.g. 10:00-11:00 and 11:00-12:00) do NOT overlap.
-        // Cancelled bookings no longer block the room.
+        // 2. Resolve and lock room with PESSIMISTIC_WRITE lock (SELECT FOR UPDATE)
+        // This ensures strict concurrency safety across multiple simultaneous requests or instances!
+        Room room;
+        if (request.getRoomId() != null) {
+            room = roomRepository.findByIdWithLock(request.getRoomId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Room not found with ID: " + request.getRoomId()));
+        } else {
+            room = roomRepository.findByNameWithLock(request.getRoomName().trim())
+                    .orElseThrow(() -> new ResourceNotFoundException("Room not found with name: " + request.getRoomName()));
+        }
+
+        if (!room.isActive()) {
+            throw new InvalidBookingException("room", "Room '" + room.getName() + "' is not active and cannot be booked");
+        }
+
+        if (attendeeSet.size() > room.getCapacity()) {
+            throw new InvalidBookingException("attendeeEmails", String.format(
+                    "Number of attendees (%d) exceeds room capacity (%d)",
+                    attendeeSet.size(), room.getCapacity()));
+        }
+
+        // 3. Safe Retries / Idempotency Check
+        // A) If explicit idempotency key is provided, check if already exists
+        String idempotencyKey = request.getIdempotencyKey() != null ? request.getIdempotencyKey().trim() : null;
+        if (idempotencyKey != null && !idempotencyKey.isEmpty()) {
+            Optional<Booking> existing = bookingRepository.findByIdempotencyKey(idempotencyKey);
+            if (existing.isPresent()) {
+                return BookingResponse.fromEntity(existing.get());
+            }
+        }
+
+        // B) Automatic retry recognition: exact same room, time slot, and organiser
+        List<Booking> exactMatches = bookingRepository
+                .findByRoomIdAndStartTimeAndEndTimeAndOrganiserEmailIgnoreCaseAndCancelledFalse(
+                        room.getId(), startTime, endTime, organiserEmail);
+        if (!exactMatches.isEmpty()) {
+            return BookingResponse.fromEntity(exactMatches.get(0));
+        }
+
+        // 4. Overlap Conflict Check
         List<Booking> clashes = bookingRepository.findOverlappingBookings(room.getId(), startTime, endTime);
         if (!clashes.isEmpty()) {
             Booking clashing = clashes.get(0);
             throw new BookingConflictException(clashing);
         }
 
-        // 7. Save and return
+        // 5. Persist booking
         Booking booking = new Booking(
                 room,
                 request.getTitle().trim(),
@@ -184,7 +211,8 @@ public class BookingService {
                 new ArrayList<>(attendeeSet),
                 startTime,
                 endTime,
-                LocalDateTime.now(clock)
+                LocalDateTime.now(clock),
+                idempotencyKey
         );
 
         Booking saved = bookingRepository.save(booking);
@@ -210,7 +238,6 @@ public class BookingService {
 
     @Transactional(readOnly = true)
     public List<BookingResponse> getBookingsForRoomAndDate(Long roomId, LocalDate date, boolean includeCancelled) {
-        // Ensure room exists
         roomService.findRoomById(roomId);
 
         LocalDateTime dayStart = date.atStartOfDay();
@@ -225,7 +252,128 @@ public class BookingService {
                 .collect(Collectors.toList());
     }
 
+    /**
+     * Q2: Finds common free slots for given attendees on a date, each at least minDurationMinutes long,
+     * within 09:00-18:00 in time order. For each slot, lists active rooms free for the whole slot
+     * with sufficient capacity.
+     */
+    @Transactional(readOnly = true)
+    public List<FreeSlotResponse> findCommonFreeSlots(LocalDate date, int minDurationMinutes, List<String> attendeeEmails) {
+        if (date == null) {
+            throw new InvalidBookingException("date", "Date is required");
+        }
+        if (minDurationMinutes <= 0) {
+            throw new InvalidBookingException("minDurationMinutes", "Minimum duration must be greater than 0");
+        }
+        if (attendeeEmails == null || attendeeEmails.isEmpty()) {
+            throw new InvalidBookingException("attendeeEmails", "At least one attendee email must be specified");
+        }
+
+        List<String> cleanedAttendees = attendeeEmails.stream()
+                .filter(e -> e != null && !e.trim().isEmpty())
+                .map(String::trim)
+                .map(String::toLowerCase)
+                .distinct()
+                .collect(Collectors.toList());
+
+        if (cleanedAttendees.isEmpty()) {
+            throw new InvalidBookingException("attendeeEmails", "Attendee emails list cannot be empty");
+        }
+
+        LocalDateTime dayStart = LocalDateTime.of(date, WORK_START);
+        LocalDateTime dayEnd = LocalDateTime.of(date, WORK_END);
+
+        // 1. Fetch all active bookings involving any of the attendees on this date across all rooms
+        List<Booking> attendeeBookings = bookingRepository.findActiveBookingsForAttendeesOnDate(
+                cleanedAttendees, date.atStartOfDay(), date.plusDays(1).atStartOfDay());
+
+        // 2. Extract and clamp busy intervals to working hours [09:00, 18:00)
+        List<TimeInterval> rawBusy = new ArrayList<>();
+        for (Booking b : attendeeBookings) {
+            LocalDateTime start = b.getStartTime();
+            LocalDateTime end = b.getEndTime();
+
+            LocalDateTime clampedStart = start.isBefore(dayStart) ? dayStart : start;
+            LocalDateTime clampedEnd = end.isAfter(dayEnd) ? dayEnd : end;
+
+            if (clampedStart.isBefore(clampedEnd)) {
+                rawBusy.add(new TimeInterval(clampedStart, clampedEnd));
+            }
+        }
+
+        // 3. Sort and merge overlapping / contiguous busy intervals
+        rawBusy.sort(Comparator.comparing(i -> i.start));
+        List<TimeInterval> mergedBusy = new ArrayList<>();
+        for (TimeInterval interval : rawBusy) {
+            if (mergedBusy.isEmpty()) {
+                mergedBusy.add(new TimeInterval(interval.start, interval.end));
+            } else {
+                TimeInterval last = mergedBusy.get(mergedBusy.size() - 1);
+                if (!interval.start.isAfter(last.end)) {
+                    if (interval.end.isAfter(last.end)) {
+                        last.end = interval.end;
+                    }
+                } else {
+                    mergedBusy.add(new TimeInterval(interval.start, interval.end));
+                }
+            }
+        }
+
+        // 4. Calculate free slots in gaps between merged busy intervals
+        List<FreeSlotResponse> freeSlots = new ArrayList<>();
+        LocalDateTime cursor = dayStart;
+
+        for (TimeInterval busy : mergedBusy) {
+            if (busy.start.isAfter(cursor)) {
+                long gapMinutes = Duration.between(cursor, busy.start).toMinutes();
+                if (gapMinutes >= minDurationMinutes) {
+                    freeSlots.add(new FreeSlotResponse(cursor, busy.start, gapMinutes, new ArrayList<>()));
+                }
+            }
+            if (busy.end.isAfter(cursor)) {
+                cursor = busy.end;
+            }
+        }
+
+        if (dayEnd.isAfter(cursor)) {
+            long gapMinutes = Duration.between(cursor, dayEnd).toMinutes();
+            if (gapMinutes >= minDurationMinutes) {
+                freeSlots.add(new FreeSlotResponse(cursor, dayEnd, gapMinutes, new ArrayList<>()));
+            }
+        }
+
+        // 5. "Where to meet": For each free slot, list active rooms big enough and free for whole slot
+        List<Room> allRooms = roomRepository.findAll();
+        int groupSize = cleanedAttendees.size();
+
+        for (FreeSlotResponse slot : freeSlots) {
+            List<RoomResponse> availableRooms = new ArrayList<>();
+            for (Room room : allRooms) {
+                if (room.isActive() && room.getCapacity() >= groupSize) {
+                    List<Booking> roomClashes = bookingRepository.findOverlappingBookings(
+                            room.getId(), slot.getStartTime(), slot.getEndTime());
+                    if (roomClashes.isEmpty()) {
+                        availableRooms.add(RoomResponse.fromEntity(room));
+                    }
+                }
+            }
+            slot.setAvailableRooms(availableRooms);
+        }
+
+        return freeSlots;
+    }
+
     private boolean isValidEmail(String email) {
         return email != null && EMAIL_PATTERN.matcher(email.trim()).matches();
+    }
+
+    private static class TimeInterval {
+        LocalDateTime start;
+        LocalDateTime end;
+
+        TimeInterval(LocalDateTime start, LocalDateTime end) {
+            this.start = start;
+            this.end = end;
+        }
     }
 }
